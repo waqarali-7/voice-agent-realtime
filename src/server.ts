@@ -64,11 +64,19 @@ app.register(async (instance) => {
           // A frame of caller audio (base64 μ-law).
           bridge.appendCallerAudio(data.media.payload);
           break;
-
+        
         case "stop":
           console.log("[Twilio] stream stopped");
           bridge.close();
           break;
+
+        // TEST-ONLY: lets the test client end the caller turn deterministically.
+        // Real Twilio never sends this event, so it's harmless in production.
+        case "commit_turn":
+          console.log("[test] committing caller turn");
+          bridge.commitCallerTurn();
+          break;
+
       }
     });
 
