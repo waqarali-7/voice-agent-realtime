@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Ava — Front Desk Voice Agent</title>
+<style>
+  :root {
+    --bg: #14161c;
+    --panel: #1c1f28;
+    --ink: #f3f1ec;
+    --muted: #8b909e;
+    --amber: #e8a33d;
+    --amber-soft: #f0c074;
+    --line: #2a2e3a;
+    --live: #5ad19a;
+    --err: #e8775d;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: radial-gradient(1200px 600px at 50% -10%, #1f2330 0%, var(--bg) 55%);
+    color: var(--ink);
+    font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100%; -webkit-font-smoothing: antialiased;
+  }
+  .card {
+    width: min(440px, 92vw);
+    background: linear-gradient(180deg, var(--panel), #181b22);
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    padding: 40px 36px 30px;
+    text-align: center;
+    box-shadow: 0 30px 80px -30px rgba(0,0,0,0.7);
+  }
+  .eyebrow {
+    font-size: 12px; letter-spacing: 0.22em; text-transform: uppercase;
+    color: var(--amber); font-weight: 600;
+  }
+  h1 { font-size: 30px; font-weight: 600; margin-top: 10px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 14.5px; margin-top: 8px; line-height: 1.5; }
+  .orb-wrap {
+    margin: 34px auto 10px; width: 168px; height: 168px;
+    display: grid; place-items: center; position: relative;
+  }
+  .orb {
+    width: 132px; height: 132px; border-radius: 50%;
+    background: radial-gradient(circle at 38% 32%, var(--amber-soft), var(--amber) 55%, #b97e22 100%);
+    transition: transform 0.1s ease; position: relative; z-index: 2;
+  }
+  .ring {
+    position: absolute; inset: 0; border-radius: 50%;
+    border: 1px solid rgba(232,163,61,0.25); opacity: 0;
+  }
+  body.live .ring { animation: pulse 2.4s ease-out infinite; }
+  @keyframes pulse {
+    0% { transform: scale(0.78); opacity: 0.55; }
+    100% { transform: scale(1.25); opacity: 0; }
+  }
+  .status { margin-top: 18px; font-size: 14px; color: var(--muted); min-height: 20px; }
+  body.live .status { color: var(--live); }
+  body.error .status { color: var(--err); }
+  .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--muted); margin-right: 7px; vertical-align: middle;
+  }
+  body.live .dot { background: var(--live); box-shadow: 0 0 10px var(--live); }
+  body.error .dot { background: var(--err); }
+  button {
+    margin-top: 26px; width: 100%; padding: 15px;
+    font-size: 15.5px; font-weight: 600; font-family: inherit;
+    color: #14161c; background: var(--amber); border: none;
+    border-radius: 13px; cursor: pointer;
+    transition: background 0.15s ease, transform 0.05s ease;
+  }
+  button:hover:not(:disabled) { background: var(--amber-soft); }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:focus-visible { outline: 2px solid var(--amber-soft); outline-offset: 3px; }
+  button.hangup { background: transparent; color: var(--amber-soft); border: 1px solid var(--line); }
+  button.hangup:hover:not(:disabled) { background: #21242e; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .transcript {
+    margin-top: 20px; text-align: left; font-size: 13.5px;
+    color: var(--muted); max-height: 132px; overflow-y: auto; line-height: 1.55;
+  }
+  .transcript div { margin-bottom: 4px; }
+  .transcript .you { color: var(--ink); }
+  .transcript .ava { color: var(--amber-soft); }
+  .foot { margin-top: 22px; font-size: 12px; color: #5c616f; }
+  @media (prefers-reduced-motion: reduce) {
+    body.live .ring { animation: none; }
+    .orb { transition: none; }
+  }
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="eyebrow">Front Desk</div>
+    <h1>Talk to Ava</h1>
+    <p class="sub">A real-time AI receptionist. Click call, allow your mic, and just talk — she answers like a real front desk.</p>
+
+    <div class="orb-wrap">
+      <span class="ring"></span>
+      <span class="ring" style="animation-delay:1.2s"></span>
+      <div class="orb" id="orb"></div>
+    </div>
+
+    <div class="status" role="status" aria-live="polite">
+      <span class="dot"></span><span id="statusText">Not connected</span>
+    </div>
+
+    <button id="callBtn" aria-label="Call Ava">Call Ava</button>
+
+    <div class="transcript" id="transcript" aria-live="polite"></div>
+
+    <p class="foot">OpenAI Realtime · the same agent that answers the phone line</p>
+  </main>
+
+<script type="module">
+  /**
+   * Web voice client. Connects the browser mic to the agent over WebRTC.
+   * The SDP handshake is proxied through our own server (/rtc/connect), so the
+   * browser never holds an API key or talks to OpenAI directly.
+   *
+   * Modelled as an explicit state machine to keep teardown correct and prevent
+   * overlapping sessions.
+   */
+
+  const els = {
+    btn: document.getElementById("callBtn"),
+    status: document.getElementById("statusText"),
+    orb: document.getElementById("orb"),
+    transcript: document.getElementById("transcript"),
+  };
+
+  /** @type {"idle"|"connecting"|"live"|"error"} */
+  let state = "idle";
+
+  const session = {
+    pc: null,
+    mic: null,
+    audioEl: null,
+    audioCtx: null,
+    rafId: 0,
+  };
+
+  function setState(next, message) {
+    state = next;
+    document.body.classList.toggle("live", next === "live");
+    document.body.classList.toggle("error", next === "error");
+    if (message) els.status.textContent = message;
+
+    const isLive = next === "live";
+    els.btn.textContent = isLive ? "End call" : "Call Ava";
+    els.btn.classList.toggle("hangup", isLive);
+    els.btn.disabled = next === "connecting";
+  }
+
+  els.btn.addEventListener("click", () => {
+    if (state === "live") teardown("Call ended");
+    else if (state === "idle" || state === "error") connect();
+    // ignore clicks while connecting
+  });
+
+  async function connect() {
+    setState("connecting", "Requesting microphone…");
+    resetTranscript();
+
+    try {
+      // 1) Mic first — if the user denies, fail fast before any network work.
+      session.mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      // 2) Peer connection + remote audio sink.
+      const pc = new RTCPeerConnection();
+      session.pc = pc;
+
+      session.audioEl = new Audio();
+      session.audioEl.autoplay = true;
+      pc.ontrack = (e) => { session.audioEl.srcObject = e.streams[0]; };
+
+      session.mic.getTracks().forEach((t) => pc.addTrack(t, session.mic));
+
+      const dc = pc.createDataChannel("oai-events");
+      dc.addEventListener("message", (e) => {
+        try { handleEvent(JSON.parse(e.data)); } catch { /* non-JSON keepalive */ }
+      });
+
+      pc.addEventListener("connectionstatechange", () => {
+        if (pc.connectionState === "connected") {
+          setState("live", "Connected — say hello");
+          startVisualizer();
+        } else if (["failed", "disconnected"].includes(pc.connectionState)) {
+          teardown("Connection lost", "error");
+        }
+      });
+
+      // 3) Offer -> our server proxy -> answer. No OpenAI details in the client.
+      setState("connecting", "Connecting to Ava…");
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      const res = await fetch("/rtc/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/sdp" },
+        body: offer.sdp,
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.error ?? `connect failed (${res.status})`);
+      }
+
+      const answerSdp = await res.text();
+      await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+    } catch (err) {
+      console.error(err);
+      const msg =
+        err?.name === "NotAllowedError"
+          ? "Microphone permission denied"
+          : "Couldn't connect — is the server running?";
+      teardown(msg, "error");
+    }
+  }
+
+  function teardown(message, nextState = "idle") {
+    cancelAnimationFrame(session.rafId);
+    session.rafId = 0;
+
+    if (session.audioCtx) { session.audioCtx.close().catch(() => {}); session.audioCtx = null; }
+    if (session.pc) { try { session.pc.close(); } catch {} session.pc = null; }
+    if (session.mic) { session.mic.getTracks().forEach((t) => t.stop()); session.mic = null; }
+    if (session.audioEl) { session.audioEl.srcObject = null; session.audioEl = null; }
+
+    els.orb.style.transform = "scale(1)";
+    setState(nextState, message);
+  }
+
+  // Clean up if the user closes/reloads the tab mid-call.
+  window.addEventListener("beforeunload", () => teardown());
+
+  // --- transcript rendering -------------------------------------------------
+  function resetTranscript() {
+    els.transcript.replaceChildren();
+    ava.el = you.el = null;
+  }
+
+  function appendTo(ref, cls, label, delta) {
+    if (!ref.el) {
+      ref.el = document.createElement("div");
+      ref.el.className = cls;
+      ref.el.innerHTML = `<strong>${label}:</strong> `;
+      els.transcript.appendChild(ref.el);
+    }
+    ref.el.append(delta);
+    els.transcript.scrollTop = els.transcript.scrollHeight;
+  }
+
+  const ava = { el: null }, you = { el: null };
+
+  function handleEvent(ev) {
+    switch (ev.type) {
+      case "response.output_audio_transcript.delta":
+        appendTo(ava, "ava", "Ava", ev.delta); break;
+      case "response.output_audio_transcript.done":
+        ava.el = null; break;
+      case "conversation.item.input_audio_transcription.delta":
+        appendTo(you, "you", "You", ev.delta); break;
+      case "conversation.item.input_audio_transcription.completed":
+        you.el = null; break;
+    }
+  }
+
+  // --- orb visualizer -------------------------------------------------------
+  function startVisualizer() {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const ctx = new AudioContext();
+    session.audioCtx = ctx;
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    ctx.createMediaStreamSource(session.mic).connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+
+    const loop = () => {
+      analyser.getByteFrequencyData(data);
+      let sum = 0;
+      for (const v of data) sum += v;
+      const level = sum / data.length / 255;
+      const scale = 1 + Math.min(level * 0.8, 0.4);
+      els.orb.style.transform = `scale(${scale.toFixed(3)})`;
+      session.rafId = requestAnimationFrame(loop);
+    };
+    loop();
+  }
+</script>
+</body>
+</html>

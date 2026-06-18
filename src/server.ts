@@ -3,11 +3,16 @@ import Fastify from "fastify";
 import websocket from "@fastify/websocket";
 import { activeAgent } from "./agent.js";
 import { RealtimeBridge } from "./bridge.js";
+import { registerRealtimeWeb } from "./realtime-web.js";
 
 const PORT = Number(process.env.PORT ?? 5050);
 
 const app = Fastify();
 await app.register(websocket);
+// Let Fastify accept the raw SDP offer body (it defaults to JSON parsing).
+app.addContentTypeParser("application/sdp", { parseAs: "string" }, (_req, body, done) => done(null, body));
+
+await registerRealtimeWeb(app);
 
 /**
  * Twilio hits this when a call comes in. We return TwiML that tells Twilio to
