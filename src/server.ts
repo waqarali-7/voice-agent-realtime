@@ -4,49 +4,60 @@ import websocket from "@fastify/websocket";
 import { activeAgent } from "./agent.js";
 import { RealtimeBridge } from "./bridge.js";
 import { registerRealtimeWeb } from "./realtime-web.js";
+import { JsonlMessageStore } from "./lib/messageStore.js";
+import { resolveHost, incomingCallTwiml } from "./twiml.js";
+import { log } from "./lib/logger.js";
 
+const logger = log("server");
 const PORT = Number(process.env.PORT ?? 5050);
+const DATA_FILE = process.env.MESSAGE_STORE_PATH ?? "./data/messages.jsonl";
+
+const store = new JsonlMessageStore(DATA_FILE);
 
 const app = Fastify();
 await app.register(websocket);
-// Let Fastify accept the raw SDP offer body (it defaults to JSON parsing).
-app.addContentTypeParser("application/sdp", { parseAs: "string" }, (_req, body, done) => done(null, body));
 
-await registerRealtimeWeb(app);
+// Accept the raw SDP offer body the browser posts (defaults to JSON otherwise).
+app.addContentTypeParser(
+  "application/sdp",
+  { parseAs: "string" },
+  (_req, body, done) => done(null, body)
+);
 
-/**
- * Twilio hits this when a call comes in. We return TwiML that tells Twilio to
- * open a Media Stream to our /media WebSocket. `{{HOST}}` is replaced with the
- * public host (your ngrok/Render URL) so Twilio knows where to connect.
- */
+// Browser web-demo routes (page + WebRTC SDP proxy), sharing the message store.
+await registerRealtimeWeb(app, store);
+
+/** Twilio voice webhook: returns TwiML that opens a Media Stream to /media. */
 app.all("/incoming-call", async (request, reply) => {
-  const host = request.headers["x-forwarded-host"] ?? request.headers.host;
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>Connecting you now.</Say>
-  <Connect>
-    <Stream url="wss://${host}/media" />
-  </Connect>
-</Response>`;
-  reply.header("Content-Type", "text/xml").send(twiml);
+  const host = resolveHost(request.headers as Record<string, unknown>);
+  reply.header("Content-Type", "text/xml").send(incomingCallTwiml(host));
 });
 
+/** Liveness + a peek at the active agent. */
 app.get("/health", async () => ({ status: "ok", agent: activeAgent.name }));
 
+/** Inspect messages the agent has taken (handy for the demo and for ops). */
+app.get("/messages", async () => {
+  const messages = await store.list();
+  return { count: messages.length, messages };
+});
+
 /**
- * Twilio Media Stream WebSocket. One connection per call. We spin up a
- * RealtimeBridge for the call and relay frames between Twilio and OpenAI.
+ * Twilio Media Stream WebSocket — one connection per call. Spin up a
+ * RealtimeBridge and relay frames between Twilio and OpenAI.
  */
 app.register(async (instance) => {
   instance.get("/media", { websocket: true }, (socket) => {
-    console.log("[Twilio] call connected");
+    logger.info("call connected");
 
-    const bridge = new RealtimeBridge(activeAgent, (msg) => {
-      // Send a message back down the Twilio socket.
-      if (socket.readyState === socket.OPEN) {
-        socket.send(JSON.stringify(msg));
-      }
-    });
+    const bridge = new RealtimeBridge(
+      activeAgent,
+      (msg) => {
+        if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(msg));
+      },
+      { store, channel: "phone" },
+      () => socket.close() // end_call tool → hang up the Twilio socket
+    );
 
     bridge.connect();
 
@@ -60,43 +71,40 @@ app.register(async (instance) => {
 
       switch (data.event) {
         case "start":
-          // Twilio tells us the streamSid we must tag outgoing audio with.
           bridge.setStreamSid(data.start.streamSid);
-          console.log("[Twilio] stream started:", data.start.streamSid);
+          logger.info("stream started", { streamSid: data.start.streamSid });
           break;
-
         case "media":
-          // A frame of caller audio (base64 μ-law).
           bridge.appendCallerAudio(data.media.payload);
           break;
-        
         case "stop":
-          console.log("[Twilio] stream stopped");
+          logger.info("stream stopped");
           bridge.close();
           break;
-
-        // TEST-ONLY: lets the test client end the caller turn deterministically.
-        // Real Twilio never sends this event, so it's harmless in production.
-        case "commit_turn":
-          console.log("[test] committing caller turn");
-          bridge.commitCallerTurn();
-          break;
-
       }
     });
 
     socket.on("close", () => {
-      console.log("[Twilio] call disconnected");
+      logger.info("call disconnected");
       bridge.close();
     });
   });
 });
 
+// --- start + graceful shutdown ---------------------------------------------
+
 try {
   await app.listen({ port: PORT, host: "0.0.0.0" });
-  console.log(`Voice agent listening on :${PORT}`);
-  console.log(`Agent persona: ${activeAgent.name}`);
+  logger.info("listening", { port: PORT, agent: activeAgent.name });
 } catch (err) {
-  console.error(err);
+  logger.error("failed to start", { err: String(err) });
   process.exit(1);
+}
+
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, async () => {
+    logger.info("shutting down", { signal });
+    await app.close();
+    process.exit(0);
+  });
 }

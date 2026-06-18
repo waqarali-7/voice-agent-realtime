@@ -140,6 +140,7 @@
   const session = {
     pc: null,
     mic: null,
+    dc: null,
     audioEl: null,
     audioCtx: null,
     rafId: 0,
@@ -182,6 +183,7 @@
       session.mic.getTracks().forEach((t) => pc.addTrack(t, session.mic));
 
       const dc = pc.createDataChannel("oai-events");
+      session.dc = dc;
       dc.addEventListener("message", (e) => {
         try { handleEvent(JSON.parse(e.data)); } catch { /* non-JSON keepalive */ }
       });
@@ -267,6 +269,46 @@
         appendTo(you, "you", "You", ev.delta); break;
       case "conversation.item.input_audio_transcription.completed":
         you.el = null; break;
+      case "response.function_call_arguments.done":
+        handleToolCall(ev); break;
+    }
+  }
+
+  /**
+   * The model called a tool. Run it on the server (so the message store stays
+   * server-side), feed the result back into the session, then ask the model to
+   * speak its acknowledgement. end_call → hang up after the farewell.
+   */
+  async function handleToolCall(ev) {
+    let args = {};
+    try { args = ev.arguments ? JSON.parse(ev.arguments) : {}; } catch {}
+
+    let result = { output: { status: "error" } };
+    try {
+      const res = await fetch("/rtc/tool", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: ev.name, arguments: args }),
+      });
+      result = await res.json();
+    } catch (err) {
+      console.error("tool exec failed", err);
+    }
+
+    if (session.dc && session.dc.readyState === "open") {
+      session.dc.send(JSON.stringify({
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: ev.call_id,
+          output: JSON.stringify(result.output ?? {}),
+        },
+      }));
+      session.dc.send(JSON.stringify({ type: "response.create" }));
+    }
+
+    if (result.endCall) {
+      setTimeout(() => teardown("Call ended"), 4000);
     }
   }
 

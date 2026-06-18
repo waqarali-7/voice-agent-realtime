@@ -1,19 +1,23 @@
 {
   "name": "voice-agent-realtime",
-  "version": "1.0.0",
-  "description": "A real-time AI phone agent — answers calls and holds natural spoken conversation by bridging Twilio Media Streams to the OpenAI Realtime API over WebSockets.",
+  "version": "2.0.0",
+  "description": "A real-time AI voice agent — answers phone calls (Twilio) and web calls (WebRTC), holds natural spoken conversation via the OpenAI Realtime API, and takes messages with function-calling.",
   "main": "dist/server.js",
+  "type": "module",
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/**/*.test.ts"
   },
   "keywords": [
     "voice-agent",
     "twilio",
+    "webrtc",
     "openai-realtime",
     "ai-receptionist",
+    "function-calling",
     "websocket",
     "speech-to-speech"
   ],
@@ -29,6 +33,5 @@
     "@types/ws": "^8.5.12",
     "tsx": "^4.16.5",
     "typescript": "^5.5.4"
-  },
-  "type": "module"
+  }
 }

@@ -1,5 +1,7 @@
 import WebSocket from "ws";
 import { Agent } from "./agent.js";
+import { toolDefinitions, dispatchTool, type ToolContext } from "./tools.js";
+import { log } from "./lib/logger.js";
 
 /**
  * RealtimeBridge connects a single phone call to the OpenAI Realtime API (GA
@@ -8,23 +10,22 @@ import { Agent } from "./agent.js";
  *   Caller speech  ─(Twilio μ-law)─►  OpenAI  ─► transcription + reasoning
  *   OpenAI speech  ◄─(Twilio μ-law)─  OpenAI  ◄─ generated audio
  *
- * Twilio Media Streams send/receive 8kHz μ-law (g711_ulaw) base64 audio.
- * The OpenAI Realtime API can consume and produce that same format directly,
- * so no resampling is needed — we just pass frames through and tag outgoing
- * frames with the Twilio streamSid.
+ * Twilio Media Streams send/receive 8kHz μ-law (g711_ulaw) base64 audio. The
+ * OpenAI Realtime API consumes and produces that same format, so frames pass
+ * straight through with no resampling, tagged with the Twilio streamSid.
  *
- * NOTE: This targets the GA Realtime interface (the beta interface, with the
- * "OpenAI-Beta: realtime=v1" header and flat audio-format strings, was removed
- * on 2026-05-12). Key GA differences vs beta:
- *   - No "OpenAI-Beta" header.
- *   - session.type must be set ("realtime").
- *   - Audio config is nested under session.audio.input/output, and the format
- *     is an object: { type: "audio/pcmu" } for G.711 μ-law.
- *   - Output audio deltas arrive as "response.output_audio.delta".
- *   - Greeting message items use content type "input_text".
+ * The agent can also call tools (e.g. take_message, end_call); tool calls are
+ * dispatched in-process and the result is fed back so the agent can speak it.
+ *
+ * Targets the GA Realtime interface (the beta interface was removed
+ * 2026-05-12): no "OpenAI-Beta" header, session.type set, audio config nested
+ * under session.audio.{input,output}, output deltas as
+ * "response.output_audio.delta".
  */
 
-const MODEL = "gpt-realtime-2";
+const logger = log("bridge");
+
+const MODEL = process.env.REALTIME_MODEL ?? "gpt-realtime-2";
 const OPENAI_REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${MODEL}`;
 
 type SendToTwilio = (twilioMessage: object) => void;
@@ -34,12 +35,21 @@ export class RealtimeBridge {
   private streamSid: string | null = null;
   private readonly agent: Agent;
   private readonly sendToTwilio: SendToTwilio;
+  private readonly toolCtx: ToolContext;
+  private readonly onEndCall: () => void;
   private ready = false;
   private responseActive = false;
 
-  constructor(agent: Agent, sendToTwilio: SendToTwilio) {
+  constructor(
+    agent: Agent,
+    sendToTwilio: SendToTwilio,
+    toolCtx: ToolContext,
+    onEndCall: () => void = () => {}
+  ) {
     this.agent = agent;
     this.sendToTwilio = sendToTwilio;
+    this.toolCtx = toolCtx;
+    this.onEndCall = onEndCall;
   }
 
   /** Open the OpenAI socket and configure the session. */
@@ -48,32 +58,26 @@ export class RealtimeBridge {
     if (!apiKey) throw new Error("OPENAI_API_KEY is not set.");
 
     this.openai = new WebSocket(OPENAI_REALTIME_URL, {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        // GA interface: do NOT send "OpenAI-Beta: realtime=v1".
-      },
+      headers: { Authorization: `Bearer ${apiKey}` },
     });
 
     this.openai.on("open", () => this.configureSession());
     this.openai.on("message", (data) => this.handleOpenAiEvent(data));
     this.openai.on("error", (err) =>
-      console.error("[OpenAI] socket error:", err.message)
+      logger.error("openai socket error", { err: err.message })
     );
     this.openai.on("close", (code, reason) => {
-      console.log(
-        `[OpenAI] connection closed (${code}) ${reason?.toString() ?? ""}`
-      );
+      logger.info("openai connection closed", {
+        code,
+        reason: reason?.toString() || undefined,
+      });
       this.ready = false;
     });
   }
 
   /**
-   * Configure the realtime session: audio formats, voice, instructions, and
-   * server-side voice activity detection so the model knows when the caller
-   * has stopped speaking and it's its turn to respond.
-   *
-   * GA shape: audio config is nested under session.audio.{input,output} and the
-   * format is an object. For Twilio's G.711 μ-law use { type: "audio/pcmu" }.
+   * Configure the realtime session: audio formats (G.711 μ-law for Twilio),
+   * voice, instructions, server-side VAD, and the agent's tools.
    */
   private configureSession(): void {
     this.send({
@@ -82,7 +86,6 @@ export class RealtimeBridge {
         type: "realtime",
         model: MODEL,
         instructions: this.agent.instructions,
-        // Keep reasoning latency low for live phone calls.
         audio: {
           input: {
             format: { type: "audio/pcmu" },
@@ -93,6 +96,8 @@ export class RealtimeBridge {
             voice: this.agent.voice,
           },
         },
+        tools: toolDefinitions(),
+        tool_choice: "auto",
       },
     });
   }
@@ -124,13 +129,13 @@ export class RealtimeBridge {
       case "session.updated":
         if (!this.ready) {
           this.ready = true;
-          console.log("[OpenAI] session ready —", this.agent.name);
+          logger.info("session ready", { agent: this.agent.name });
           this.sendGreeting();
         }
         break;
 
-      // Track whether a response is currently being generated, so we don't
-      // cancel when nothing is active or start a new response over a live one.
+      // Track response lifecycle so we never cancel nothing or start a
+      // response over a live one.
       case "response.created":
         this.responseActive = true;
         break;
@@ -139,8 +144,7 @@ export class RealtimeBridge {
         this.responseActive = false;
         break;
 
-      // A chunk of generated audio — forward it to the caller via Twilio.
-      // GA event name is "response.output_audio.delta".
+      // Generated audio chunk → forward to the caller via Twilio.
       case "response.output_audio.delta":
         if (this.streamSid && event.delta) {
           this.sendToTwilio({
@@ -150,18 +154,14 @@ export class RealtimeBridge {
           });
         }
         break;
-      
-      case "error":
-        console.error("[OpenAI] error event:", event.error);
-        // If a response failed to start/finish, don't leave the flag stuck.
-        this.responseActive = false;
-        break;  
 
-      // Caller started talking while the agent was speaking — clear the
-      // queued audio so the agent stops and listens (barge-in handling),
-      // and cancel the in-flight response on the OpenAI side — but only if
-      // a response is actually active, otherwise OpenAI returns
-      // "response_cancel_not_active".
+      // The model finished assembling a tool call.
+      case "response.function_call_arguments.done":
+        void this.handleToolCall(event);
+        break;
+
+      // Barge-in: caller speaks over the agent. Clear queued audio and cancel
+      // the in-flight response — but only if one is active.
       case "input_audio_buffer.speech_started":
         if (this.streamSid && this.responseActive) {
           this.sendToTwilio({ event: "clear", streamSid: this.streamSid });
@@ -170,44 +170,49 @@ export class RealtimeBridge {
         break;
 
       case "error":
-        console.error("[OpenAI] error event:", event.error);
+        logger.error("openai error event", { error: event.error });
+        // Don't leave the flag stuck if a response failed to start/finish.
+        this.responseActive = false;
         break;
+    }
+  }
+
+  /** Run a tool the model called, feed the result back, let the agent speak it. */
+  private async handleToolCall(event: any): Promise<void> {
+    const name: string = event.name;
+    const callId: string = event.call_id;
+    let args: Record<string, any> = {};
+    try {
+      args = event.arguments ? JSON.parse(event.arguments) : {};
+    } catch {
+      logger.warn("tool args not valid JSON", { name });
+    }
+
+    logger.info("tool call", { name, callId });
+    const result = await dispatchTool(name, args, this.toolCtx);
+
+    // Return the tool output to the model.
+    this.send({
+      type: "conversation.item.create",
+      item: {
+        type: "function_call_output",
+        call_id: callId,
+        output: JSON.stringify(result.output),
+      },
+    });
+    // Ask the model to speak a natural acknowledgement of the result.
+    this.send({ type: "response.create" });
+
+    // If the tool signals the call should end, close once the agent has had a
+    // moment to deliver its farewell.
+    if (result.endCall) {
+      setTimeout(() => this.onEndCall(), 4000);
     }
   }
 
   /** Twilio sent us a frame of caller audio — forward it to OpenAI. */
   appendCallerAudio(payloadBase64: string): void {
-    this.send({
-      type: "input_audio_buffer.append",
-      audio: payloadBase64,
-    });
-  }
-
-  /**
-   * Manually end the caller's turn and ask the model to respond.
-   *
-   * In production (real phone calls) server VAD handles this automatically, so
-   * you normally don't call this. It's useful for scripted tests where you
-   * stream a fixed audio clip and want a deterministic response.
-   *
-   * We refuse to commit while a response is still active (e.g. the greeting is
-   * still playing), since that produces "conversation_already_has_active_
-   * response". The test client should wait for the greeting to finish first.
-   */
-  commitCallerTurn(): void {
-    if (this.responseActive) {
-      console.warn(
-        "[bridge] commitCallerTurn skipped — a response is still active (greeting still playing?)"
-      );
-      return;
-    }
-    this.send({ type: "input_audio_buffer.commit" });
-    this.send({ type: "response.create" });
-  }
-
-  /** True while the model is generating a response. */
-  isResponseActive(): boolean {
-    return this.responseActive;
+    this.send({ type: "input_audio_buffer.append", audio: payloadBase64 });
   }
 
   setStreamSid(sid: string): void {
